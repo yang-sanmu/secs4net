@@ -5,6 +5,8 @@ using System;
 using System.Collections.Generic;
 using System.IO.Pipelines;
 using System.Linq;
+using System.Net;
+using System.Net.Sockets;
 using System.Threading;
 using System.Threading.Tasks;
 using Xunit;
@@ -183,6 +185,86 @@ public class SecsGemUnitTests
         await SendAsyncManyMessagesAtOnce(connection1, connection2, cts.Token);
     }
 
+    [Fact]
+    public async Task HsmsConnection_Start_Should_Not_Spawn_Parallel_Connection_Loops()
+    {
+        var port = GetFreeTcpPort();
+        var options = CreateConnectionOptions(isActive: true, port: port, t5: 1000);
+        await using var connection = new HsmsConnection(options, Substitute.For<ISecsGemLogger>());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+
+        var transitions = new List<ConnectionState>();
+        var syncRoot = new object();
+        connection.ConnectionChanged += (_, state) =>
+        {
+            lock (syncRoot)
+            {
+                transitions.Add(state);
+            }
+        };
+
+        await Task.WhenAll(Enumerable.Range(0, 20).Select(_ => Task.Run(() => connection.Start(cts.Token), cts.Token)));
+
+        SpinWait.SpinUntil(() =>
+        {
+            lock (syncRoot)
+            {
+                return transitions.Count > 0;
+            }
+        }, TimeSpan.FromSeconds(2)).Should().BeTrue();
+
+        await Task.Delay(200, cts.Token);
+
+        lock (syncRoot)
+        {
+            transitions.Count(state => state == ConnectionState.Connecting).Should().Be(1);
+        }
+    }
+
+    [Fact]
+    public async Task HsmsConnection_Reconnect_Should_Only_Run_One_Retry_Cycle_When_Triggered_Concurrently()
+    {
+        var port = GetFreeTcpPort();
+        var activeOptions = CreateConnectionOptions(isActive: true, port: port, t5: 200);
+        var passiveOptions = CreateConnectionOptions(isActive: false, port: port, t5: 200);
+        await using var activeConnection = new HsmsConnection(activeOptions, Substitute.For<ISecsGemLogger>());
+        await using var passiveConnection = new HsmsConnection(passiveOptions, Substitute.For<ISecsGemLogger>());
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(15));
+
+        activeConnection.Start(cts.Token);
+        passiveConnection.Start(cts.Token);
+
+        SpinWait.SpinUntil(
+            () => activeConnection.State is ConnectionState.Selected && passiveConnection.State is ConnectionState.Selected,
+            TimeSpan.FromSeconds(5)).Should().BeTrue();
+
+        var transitions = new List<ConnectionState>();
+        var syncRoot = new object();
+        activeConnection.ConnectionChanged += (_, state) =>
+        {
+            lock (syncRoot)
+            {
+                transitions.Add(state);
+            }
+        };
+
+        await Task.WhenAll(Enumerable.Range(0, 20).Select(_ => Task.Run(activeConnection.Reconnect, cts.Token)));
+
+        SpinWait.SpinUntil(
+            () => activeConnection.State is ConnectionState.Selected && passiveConnection.State is ConnectionState.Selected,
+            TimeSpan.FromSeconds(10)).Should().BeTrue();
+
+        await Task.Delay(300, cts.Token);
+
+        lock (syncRoot)
+        {
+            transitions.Count(state => state == ConnectionState.Retry).Should().Be(1);
+            transitions.Count(state => state == ConnectionState.Connecting).Should().Be(1);
+            transitions.Count(state => state == ConnectionState.Connected).Should().Be(1);
+            transitions.Count(state => state == ConnectionState.Selected).Should().Be(1);
+        }
+    }
+
     private static async Task SendAsyncManyMessagesAtOnce(ISecsConnection connection1, ISecsConnection connection2, CancellationToken cancellation)
     {
         using var secsGem1 = new SecsGem(OptionsActive, connection1, Substitute.For<ISecsGemLogger>());
@@ -219,5 +301,22 @@ public class SecsGemUnitTests
         };
 
         await sendAsync.Should().NotThrowAsync();
+    }
+
+    private static IOptions<SecsGemOptions> CreateConnectionOptions(bool isActive, int port, int t5)
+        => Options.Create(new SecsGemOptions
+        {
+            IsActive = isActive,
+            DeviceId = 0,
+            IpAddress = IPAddress.Loopback.ToString(),
+            Port = port,
+            T5 = t5,
+        });
+
+    private static int GetFreeTcpPort()
+    {
+        using var listener = new TcpListener(IPAddress.Loopback, 0);
+        listener.Start();
+        return ((IPEndPoint)listener.LocalEndpoint).Port;
     }
 }

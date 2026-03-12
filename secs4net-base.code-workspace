@@ -1,0 +1,14 @@
+{
+	"folders": [
+		{
+			"path": "../Src/secs4net-base"
+		},
+		{
+			"path": "."
+		},
+		{
+			"path": "../SecsRouter"
+		}
+	],
+	"settings": {}
+}

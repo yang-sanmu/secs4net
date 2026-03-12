@@ -22,6 +22,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
     public int T7 { get; }
     public int T8 { get; }
     public int LinkTestInterval { get; }
+    private readonly object _stateSyncRoot = new();
     public bool LinkTestEnabled
     {
         get => _linkTestEnable;
@@ -79,6 +80,10 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
     private readonly SemaphoreSlim _sendLock = new(initialCount: 1);
 
     private CancellationToken _stoppingToken;
+    private bool _reconnectInProgress;
+    private int _connectionLoopId;
+    private Task? _connectionLoopTask;
+    private CancellationTokenSource? _connectionLoopCancellationTokenSource;
     private CancellationTokenSource? _cancellationTokenSourceForPipeDecoder;
     private readonly CancellationTokenSource _cancellationSourceForControlMessageProcessing = new();
 
@@ -135,6 +140,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
                 var connected = false;
                 do
                 {
+                    cancellation.ThrowIfCancellationRequested();
                     if (IsDisposed)
                     {
                         return;
@@ -154,9 +160,14 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
                         await socket.ConnectAsync(IpAddress, Port).WithCancellation(cancellation).ConfigureAwait(false);
 #endif
 
+                        cancellation.ThrowIfCancellationRequested();
                         _socket = socket;
                         CommunicationStateChanging(ConnectionState.Connected);
                         connected = true;
+                    }
+                    catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+                    {
+                        return;
                     }
                     catch (Exception ex) when (!IsDisposed)
                     {
@@ -185,6 +196,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
                 var connected = false;
                 do
                 {
+                    cancellation.ThrowIfCancellationRequested();
                     if (IsDisposed)
                     {
                         return;
@@ -198,10 +210,15 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
 #else
                         _socket = await server.AcceptAsync().WithCancellation(cancellation).ConfigureAwait(false);
 #endif
+                        cancellation.ThrowIfCancellationRequested();
                         _socket.Blocking = false;
                         _socket.ReceiveBufferSize = _socketReceiveBufferSize;
                         CommunicationStateChanging(ConnectionState.Connected);
                         connected = true;
+                    }
+                    catch (OperationCanceledException) when (cancellation.IsCancellationRequested)
+                    {
+                        return;
                     }
                     catch (Exception ex) when (!IsDisposed)
                     {
@@ -245,10 +262,62 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
     public void Start(CancellationToken cancellation)
     {
         _stoppingToken = cancellation;
-        Task.Run(() => _startImpl(cancellation), cancellation);
+        StartConnectionLoop(cancellation, restart: false);
     }
 
-    private async Task StartPipeDecoderConsumerAsync(CancellationToken cancellation)
+    private void StartConnectionLoop(CancellationToken cancellation, bool restart)
+    {
+        CancellationTokenSource? previousConnectionLoopCancellationTokenSource = null;
+        int connectionLoopId;
+        lock (_stateSyncRoot)
+        {
+            if (IsDisposed || cancellation.IsCancellationRequested)
+            {
+                return;
+            }
+
+            if (!restart && _connectionLoopTask is { IsCompleted: false })
+            {
+                return;
+            }
+
+            if (restart)
+            {
+                previousConnectionLoopCancellationTokenSource = _connectionLoopCancellationTokenSource;
+            }
+
+            connectionLoopId = unchecked(++_connectionLoopId);
+            var connectionLoopCancellationTokenSource = CancellationTokenSource.CreateLinkedTokenSource(cancellation);
+            _connectionLoopCancellationTokenSource = connectionLoopCancellationTokenSource;
+            _connectionLoopTask = Task.Run(() => RunConnectionLoopAsync(connectionLoopCancellationTokenSource), CancellationToken.None);
+        }
+
+        previousConnectionLoopCancellationTokenSource?.Cancel();
+    }
+
+    private async Task RunConnectionLoopAsync(CancellationTokenSource connectionLoopCancellationTokenSource)
+    {
+        try
+        {
+            await _startImpl(connectionLoopCancellationTokenSource.Token).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (connectionLoopCancellationTokenSource.IsCancellationRequested) { }
+        finally
+        {
+            lock (_stateSyncRoot)
+            {
+                if (ReferenceEquals(_connectionLoopCancellationTokenSource, connectionLoopCancellationTokenSource))
+                {
+                    _connectionLoopCancellationTokenSource = null;
+                    _connectionLoopTask = null;
+                }
+            }
+
+            connectionLoopCancellationTokenSource.Dispose();
+        }
+    }
+
+    private async Task StartPipeDecoderConsumerAsync(int connectionLoopId, CancellationToken cancellation)
     {
         try
         {
@@ -261,12 +330,11 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
                 return;
             }
             _logger.Error("Unexpected exception on StartAsyncStreamDecoderAsync", ex);
-            Reconnect();
+            CommunicationStateChanging(ConnectionState.Retry, connectionLoopId);
         }
     }
 
-
-    private async Task StartPipeDecoderProducerAsync(CancellationToken cancellation)
+    private async Task StartPipeDecoderProducerAsync(int connectionLoopId, CancellationToken cancellation)
     {
         var decoderInput = _pipeDecoder.Input;
         try
@@ -288,7 +356,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
 #endif
                 if (count == 0)
                 {
-                    Reconnect();
+                    CommunicationStateChanging(ConnectionState.Retry, connectionLoopId);
                     break;
                 }
             }
@@ -300,7 +368,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
                 return;
             }
             _logger.Error("Unhandled exception occurred on PipeDecoder producer", ex);
-            Reconnect();
+            CommunicationStateChanging(ConnectionState.Retry, connectionLoopId);
         }
     }
 
@@ -320,37 +388,71 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
     public void Reconnect()
         => CommunicationStateChanging(ConnectionState.Retry);
 
-    private void CommunicationStateChanging(ConnectionState newState)
+    private void CommunicationStateChanging(ConnectionState newState, int? expectedConnectionLoopId = null)
     {
-        State = newState;
-        ConnectionChanged?.Invoke(this, State);
-
-        switch (State)
+        bool raiseConnectionChanged = false;
+        int connectionLoopId = 0;
+        lock (_stateSyncRoot)
         {
-            case ConnectionState.Selected:
-#if !DISABLE_TIMER
-                _timer7.Change(Timeout.Infinite, Timeout.Infinite);
-                _logger.Info("Stop T7 Timer");
-#endif
-                break;
-            case ConnectionState.Connected:
-#if !DISABLE_TIMER
-                _cancellationTokenSourceForPipeDecoder = new CancellationTokenSource();
-                Task.Run(() => StartPipeDecoderConsumerAsync(_cancellationTokenSourceForPipeDecoder.Token));
-                Task.Run(() => StartPipeDecoderProducerAsync(_cancellationTokenSourceForPipeDecoder.Token));
-                _logger.Info($"Start T7 Timer: {T7 / 1000} sec.");
-                _timer7.Change(T7, Timeout.Infinite);
-#endif
-                break;
-            case ConnectionState.Retry:
-                if (IsDisposed)
+            if (newState == ConnectionState.Retry)
+            {
+                if (expectedConnectionLoopId is int expectedId && expectedId != _connectionLoopId)
                 {
                     return;
                 }
 
-                Disconnect();
-                Start(_stoppingToken);
-                break;
+                if (_reconnectInProgress)
+                {
+                    if (State != ConnectionState.Connected)
+                    {
+                        return;
+                    }
+                }
+
+                _reconnectInProgress = true;
+            }
+            else if (newState == ConnectionState.Selected)
+            {
+                _reconnectInProgress = false;
+            }
+
+            State = newState;
+            raiseConnectionChanged = true;
+
+            switch (State)
+            {
+                case ConnectionState.Selected:
+#if !DISABLE_TIMER
+                    _timer7.Change(Timeout.Infinite, Timeout.Infinite);
+                    _logger.Info("Stop T7 Timer");
+#endif
+                    break;
+                case ConnectionState.Connected:
+#if !DISABLE_TIMER
+                    connectionLoopId = _connectionLoopId;
+                    _cancellationTokenSourceForPipeDecoder = new CancellationTokenSource();
+                    Task.Run(() => StartPipeDecoderConsumerAsync(connectionLoopId, _cancellationTokenSourceForPipeDecoder.Token));
+                    Task.Run(() => StartPipeDecoderProducerAsync(connectionLoopId, _cancellationTokenSourceForPipeDecoder.Token));
+                    _logger.Info($"Start T7 Timer: {T7 / 1000} sec.");
+                    _timer7.Change(T7, Timeout.Infinite);
+#endif
+                    break;
+                case ConnectionState.Retry:
+                    if (IsDisposed)
+                    {
+                        return;
+                    }
+
+                    _connectionLoopCancellationTokenSource?.Cancel();
+                    Disconnect();
+                    StartConnectionLoop(_stoppingToken, restart: true);
+                    break;
+            }
+        }
+
+        if (raiseConnectionChanged)
+        {
+            ConnectionChanged?.Invoke(this, State);
         }
     }
 
@@ -508,6 +610,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
             await SendControlMessage(MessageType.SeparateRequest, MessageIdGenerator.NewId()).ConfigureAwait(false);
         }
 
+        _connectionLoopCancellationTokenSource?.Cancel();
         Disconnect();
         _cancellationSourceForControlMessageProcessing.Cancel();
         _cancellationSourceForControlMessageProcessing.Dispose();
