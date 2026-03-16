@@ -169,6 +169,58 @@ public class ItemUnitTest
     }
 
     [Fact]
+    public void Item_Clone_Should_Create_Equivalent_Independent_Copy()
+    {
+        using var source =
+            L(
+                A("A"),
+                U4(1, 2, 3),
+                L(
+                    Boolean(true, false),
+                    B(0x01, 0x02))
+            );
+
+        using var clone = source.Clone();
+
+        clone.Should().BeEquivalentTo(source);
+        clone.Should().NotBeSameAs(source);
+        clone[1].Should().NotBeSameAs(source[1]);
+        clone[2].Should().NotBeSameAs(source[2]);
+        clone[2][0].Should().NotBeSameAs(source[2][0]);
+
+        var clonedValues = clone[1].GetMemory<uint>();
+        clonedValues.Span[0] = 9;
+
+        source[1].FirstValue<uint>().Should().Be(1);
+        clone[1].FirstValue<uint>().Should().Be(9);
+    }
+
+    [Fact]
+    public void SecsMessage_Clone_Should_Create_Equivalent_Independent_Copy()
+    {
+        using var source = new SecsMessage(1, 13)
+        {
+            Name = "Test",
+            SecsItem =
+                L(
+                    A("A"),
+                    U4(1, 2, 3))
+        };
+
+        using var clone = source.Clone();
+
+        clone.Should().BeEquivalentTo(source);
+        clone.Should().NotBeSameAs(source);
+        clone.SecsItem.Should().NotBeSameAs(source.SecsItem);
+
+        var clonedValues = clone.SecsItem![1].GetMemory<uint>();
+        clonedValues.Span[0] = 9;
+
+        source.SecsItem![1].FirstValue<uint>().Should().Be(1);
+        clone.SecsItem![1].FirstValue<uint>().Should().Be(9);
+    }
+
+    [Fact]
     public void Item_Throw_Not_Supported_Exception_With_Format_Unmatch()
     {
         using (var stringItem = A("string"))

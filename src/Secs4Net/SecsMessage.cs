@@ -44,6 +44,13 @@ public sealed class SecsMessage : IDisposable
         ReplyExpected = replyExpected;
     }
 
+    public SecsMessage Clone()
+        => new(S, F, ReplyExpected)
+        {
+            Name = Name,
+            SecsItem = SecsItem?.Clone(),
+        };
+
     public void Dispose()
     {
         SecsItem?.Dispose();
