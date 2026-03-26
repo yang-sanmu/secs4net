@@ -33,6 +33,20 @@ partial class Item
 
         public override Item[] Items => _value;
 
+        public override string FirstValueToString()
+            => throw ThrowNotSupportException(Format);
+
+        public override Item Clone()
+        {
+            Item[] clonedItems = new Item[_value.Length];
+            for (int i = 0; i < _value.Length; i++)
+            {
+                clonedItems[i] = _value[i].Clone();
+            }
+
+            return new ListItem(clonedItems);
+        }
+
         public override void EncodeTo(IBufferWriter<byte> buffer)
         {
             var arr = _value.AsSpan();

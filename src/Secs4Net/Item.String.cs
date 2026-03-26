@@ -22,6 +22,17 @@ partial class Item
         public override string GetString()
             => _value;
 
+        public override string FirstValueToString()
+            => _value;
+
+        public override Item Clone()
+            => Format switch
+            {
+                SecsFormat.ASCII => A(_value),
+                SecsFormat.JIS8 => J(_value),
+                _ => throw new ArgumentOutOfRangeException(nameof(Format), Format, "invalid SecsFormat value")
+            };
+
         public override void EncodeTo(IBufferWriter<byte> buffer)
         {
             if (_value.Length == 0)

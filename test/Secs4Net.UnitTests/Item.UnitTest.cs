@@ -2,6 +2,7 @@ using CommunityToolkit.HighPerformance.Buffers;
 using FluentAssertions;
 using System;
 using System.Buffers;
+using System.Globalization;
 using System.Linq;
 using Xunit;
 
@@ -535,6 +536,65 @@ public class ItemUnitTest
         var item2 = DecodeFromFullBuffer(ref encodedSequence);
         encodedSequence.IsEmpty.Should().BeTrue();
         item.Should().BeEquivalentTo(item2);
+    }
+
+    [Fact]
+    public void Item_FirstValueToString_Should_Return_Null_For_Null_Item()
+    {
+        Item? item = null;
+
+        item?.FirstValueToString().Should().BeNull();
+    }
+
+    [Fact]
+    public void Item_FirstValueToString_Should_Return_First_Value_For_Supported_Formats()
+    {
+        A("A string").FirstValueToString().Should().Be("A string");
+        J("J string").FirstValueToString().Should().Be("J string");
+        Boolean(true).FirstValueToString().Should().Be("true");
+        B(0x1C, 0x01, 0xFF).FirstValueToString().Should().Be("28");
+        U1(122, 34).FirstValueToString().Should().Be("122");
+        U2(34531, 23123).FirstValueToString().Should().Be("34531");
+        U4(2123513u, 52451141u).FirstValueToString().Should().Be("2123513");
+        U8(1258833613ul, 4513153356ul).FirstValueToString().Should().Be("1258833613");
+        I1(122, 34).FirstValueToString().Should().Be("122");
+        I2(-1235, 23123).FirstValueToString().Should().Be("-1235");
+        I4(-2123513, 52451141).FirstValueToString().Should().Be("-2123513");
+        I8(1266138966, -156114).FirstValueToString().Should().Be("1266138966");
+        F4(23123.21323f, 2324.221f).FirstValueToString().Should().Be(23123.21323f.ToString(CultureInfo.InvariantCulture));
+        F8(231.00002321d, 0.2913212312d).FirstValueToString().Should().Be(231.00002321d.ToString(CultureInfo.InvariantCulture));
+    }
+
+    [Fact]
+    public void Item_FirstValueToString_Should_Use_Invariant_Culture_For_Numeric_Formats()
+    {
+        var originalCulture = CultureInfo.CurrentCulture;
+        var originalUICulture = CultureInfo.CurrentUICulture;
+
+        try
+        {
+            var culture = new CultureInfo("fr-FR");
+            CultureInfo.CurrentCulture = culture;
+            CultureInfo.CurrentUICulture = culture;
+
+            F8(1.5d).FirstValueToString().Should().Be("1.5");
+        }
+        finally
+        {
+            CultureInfo.CurrentCulture = originalCulture;
+            CultureInfo.CurrentUICulture = originalUICulture;
+        }
+    }
+
+    [Fact]
+    public void Item_FirstValueToString_Should_Throw_For_Unsupported_Format()
+    {
+        using var item = L(A("AA"));
+
+        Action action = () => item.FirstValueToString();
+
+        action.Should().Throw<NotSupportedException>()
+            .WithMessage($"FirstValueToString is not supported, since the item's {nameof(Item.Format)} is {item.Format}");
     }
 }
 

@@ -87,37 +87,11 @@ public abstract partial class Item : IEquatable<Item>, IDisposable
     public virtual string GetString()
         => throw ThrowNotSupportException(Format);
 
-    public Item Clone()
-        => Format switch
-        {
-            SecsFormat.List => L(CloneItems(Items)),
-            SecsFormat.ASCII => A(GetString()),
-            SecsFormat.JIS8 => J(GetString()),
-            SecsFormat.Binary => B(GetMemory<byte>().ToArray()),
-            SecsFormat.Boolean => Boolean(GetMemory<bool>().ToArray()),
-            SecsFormat.I1 => I1(GetMemory<sbyte>().ToArray()),
-            SecsFormat.I2 => I2(GetMemory<short>().ToArray()),
-            SecsFormat.I4 => I4(GetMemory<int>().ToArray()),
-            SecsFormat.I8 => I8(GetMemory<long>().ToArray()),
-            SecsFormat.U1 => U1(GetMemory<byte>().ToArray()),
-            SecsFormat.U2 => U2(GetMemory<ushort>().ToArray()),
-            SecsFormat.U4 => U4(GetMemory<uint>().ToArray()),
-            SecsFormat.U8 => U8(GetMemory<ulong>().ToArray()),
-            SecsFormat.F4 => F4(GetMemory<float>().ToArray()),
-            SecsFormat.F8 => F8(GetMemory<double>().ToArray()),
-            _ => throw new ArgumentOutOfRangeException(nameof(Format), Format, "invalid SecsFormat value")
-        };
+    public virtual string FirstValueToString()
+        => throw ThrowNotSupportException(Format);
 
-    private static Item[] CloneItems(Item[] items)
-    {
-        var clonedItems = new Item[items.Length];
-        for (int i = 0; i < items.Length; i++)
-        {
-            clonedItems[i] = items[i].Clone();
-        }
-
-        return clonedItems;
-    }
+    public virtual Item Clone() 
+        => throw ThrowNotSupportException(Format);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static NotSupportedException ThrowNotSupportException(SecsFormat format, [CallerMemberName] string? memberName = null)
