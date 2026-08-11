@@ -1,9 +1,15 @@
 <Project>
 	<PropertyGroup>
-		<Version>3.1.3</Version>
-		<RepositoryUrl>https://github.com/yang-sanmu/secs4net</RepositoryUrl>
-		<Authors>yang-sanmu</Authors>
+		<Version>3.1.4</Version>
+		<!-- Change these three properties before the first public release of your fork. -->
+		<ForkPackagePrefix>YangSanmu.Secs4Net</ForkPackagePrefix>
+		<ForkMaintainer>yang-sanmu</ForkMaintainer>
+		<ForkRepositoryUrl>https://github.com/yang-sanmu/secs4net</ForkRepositoryUrl>
+		<RepositoryUrl>$(ForkRepositoryUrl)</RepositoryUrl>
+		<Authors>$(ForkMaintainer), secs4net contributors</Authors>
 		<PackageLicenseExpression>MIT</PackageLicenseExpression>
+		<Description>Fork of Secs4Net: SECS-II/HSMS-SS/GEM implementation on .NET.</Description>
+		<PackageTags>secs;gem;hsms;semi;secs4net;fork</PackageTags>
 		<Nullable>enable</Nullable>
 		<LangVersion>12.0</LangVersion>
 		<Deterministic>true</Deterministic>
@@ -14,8 +20,8 @@
 		<EmbedUntrackedSources>true</EmbedUntrackedSources>
 		<EnablePackageValidation>true</EnablePackageValidation>
 		<EnableWindowsTargeting>true</EnableWindowsTargeting>
-		<Copyright>Copyright © secs4net 2024</Copyright>
-		<PackageProjectUrl>https://github.com/yang-sanmu/secs4net</PackageProjectUrl>
+		<Copyright>Copyright secs4net contributors</Copyright>
+		<PackageProjectUrl>$(ForkRepositoryUrl)</PackageProjectUrl>
 	</PropertyGroup>
 
 	<ItemGroup>

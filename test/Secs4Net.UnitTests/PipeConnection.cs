@@ -23,6 +23,12 @@ public sealed class PipeConnection : ISecsConnection
     Task ISecsConnection.SendAsync(ReadOnlyMemory<byte> source, CancellationToken cancellation)
         => SendAsync(source, cancellation);
 
+    event EventHandler<DataMessageDecodeErrorEventArgs>? ISecsConnection.DataMessageDecodeError
+    {
+        add => _decoder.DataMessageDecodeError += value;
+        remove => _decoder.DataMessageDecodeError -= value;
+    }
+
     private async Task SendAsync(ReadOnlyMemory<byte> source, CancellationToken cancellation)
     {
         await _sendLock.WaitAsync(cancellation).ConfigureAwait(false);

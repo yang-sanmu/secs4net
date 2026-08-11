@@ -2,6 +2,7 @@
 using CommunityToolkit.HighPerformance.Buffers;
 using System.Buffers;
 using System.Diagnostics.CodeAnalysis;
+using System.IO;
 using System.Runtime.CompilerServices;
 using System.Text;
 
@@ -9,6 +10,8 @@ namespace Secs4Net;
 
 public partial class Item
 {
+    internal const int MaximumListNestingDepth = 100;
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     internal static void DecodeFormatAndLengthByteCount(in ReadOnlySequence<byte> sourceBytes, out SecsFormat format, out byte lengthByteCount)
     {
@@ -41,9 +44,27 @@ public partial class Item
     [MethodImpl(MethodImplOptions.NoInlining)]
     [SkipLocalsInit]
     public static Item DecodeFromFullBuffer(ref ReadOnlySequence<byte> bytes)
+        => DecodeFromFullBuffer(ref bytes, nestingDepth: 0);
+
+    private static Item DecodeFromFullBuffer(ref ReadOnlySequence<byte> bytes, int nestingDepth)
     {
+        if (bytes.IsEmpty)
+        {
+            throw new InvalidDataException("The SECS-II data ended before an item format byte was received.");
+        }
+
         var formatSeq = bytes.Slice(0, 1);
         DecodeFormatAndLengthByteCount(formatSeq, out var format, out var lengthByteCount);
+
+        if (lengthByteCount == 0)
+        {
+            throw new InvalidDataException("A SECS-II item must use between one and three length bytes.");
+        }
+
+        if (bytes.Length - 1 < lengthByteCount)
+        {
+            throw new InvalidDataException("The SECS-II data ended inside an item length field.");
+        }
 
         var dataLengthSeq = bytes.Slice(formatSeq.End, lengthByteCount);
         var dataLength = DecodeDataLength(dataLengthSeq);
@@ -56,13 +77,39 @@ public partial class Item
                 return L();
             }
 
-            var items = new Item[dataLength];
-            foreach (ref var subItem in items.AsSpan())
+            ValidateListItemCount(dataLength, bytes.Length);
+            if (nestingDepth >= MaximumListNestingDepth)
             {
-                subItem = DecodeFromFullBuffer(ref bytes);
+                throw new InvalidDataException($"SECS-II List nesting exceeds the maximum depth of {MaximumListNestingDepth}.");
+            }
+
+            var items = new Item[dataLength];
+            var decodedItemCount = 0;
+            try
+            {
+                foreach (ref var subItem in items.AsSpan())
+                {
+                    subItem = DecodeFromFullBuffer(ref bytes, nestingDepth + 1);
+                    decodedItemCount++;
+                }
+            }
+            catch
+            {
+                for (var i = 0; i < decodedItemCount; i++)
+                {
+                    items[i].Dispose();
+                }
+
+                throw;
             }
 
             return L(items);
+        }
+
+        if (dataLength > bytes.Length)
+        {
+            throw new InvalidDataException(
+                $"SECS-II item length {dataLength} exceeds the {bytes.Length} byte(s) left in the buffer.");
         }
 
         var dataItemBytes = bytes.Slice(0, dataLength);
@@ -74,6 +121,7 @@ public partial class Item
     internal static Item DecodeDataItem(SecsFormat format, in ReadOnlySequence<byte> bytes)
     {
         var length = (int)bytes.Length;
+        ValidateDataItemLength(format, length);
         return (format, length) switch
         {
             (SecsFormat.ASCII, 0) => A(),
@@ -157,13 +205,49 @@ public partial class Item
         static unsafe IMemoryOwner<T> DecodeMemoryOwner<T>(int length, in ReadOnlySequence<byte> bytes) where T : unmanaged, IEquatable<T>
         {
             var owner = MemoryOwner<T>.Allocate(length / sizeof(T));
-            var span = owner.Span;
-            bytes.CopyTo(span.AsBytes());
-            ReverseEndiannessHelper<T>.Reverse(span);
-            return owner;
+            try
+            {
+                var span = owner.Span;
+                bytes.CopyTo(span.AsBytes());
+                ReverseEndiannessHelper<T>.Reverse(span);
+                return owner;
+            }
+            catch
+            {
+                owner.Dispose();
+                throw;
+            }
         }
 
         [DoesNotReturn]
         static Item ThrowHelper() => throw new ArgumentOutOfRangeException();
+    }
+
+    internal static void ValidateListItemCount(int itemCount, long remainingByteCount)
+    {
+        // Every child requires at least a format byte and one length byte. Check this before
+        // allocating the Item[] so a tiny malformed frame cannot request a huge allocation.
+        if (itemCount > remainingByteCount / 2)
+        {
+            throw new InvalidDataException(
+                $"SECS-II List declares {itemCount} item(s), but at most {remainingByteCount / 2} can fit in the {remainingByteCount} remaining byte(s).");
+        }
+    }
+
+    private static void ValidateDataItemLength(SecsFormat format, int byteLength)
+    {
+        var elementSize = format switch
+        {
+            SecsFormat.I2 or SecsFormat.U2 => 2,
+            SecsFormat.I4 or SecsFormat.F4 or SecsFormat.U4 => 4,
+            SecsFormat.I8 or SecsFormat.F8 or SecsFormat.U8 => 8,
+            _ => 1,
+        };
+
+        if (byteLength % elementSize != 0)
+        {
+            throw new InvalidDataException(
+                $"SECS-II {format} item length {byteLength} is not divisible by its {elementSize}-byte element size.");
+        }
     }
 }

@@ -3,6 +3,7 @@ using FluentAssertions;
 using System;
 using System.Buffers;
 using System.Globalization;
+using System.IO;
 using System.Linq;
 using Xunit;
 
@@ -456,6 +457,47 @@ public class ItemUnitTest
         using var item2 = DecodeFromFullBuffer(ref encodedBytes);
         //encodedBytes.IsEmpty.Should().BeTrue();
         item.Should().BeEquivalentTo(item2);
+    }
+
+    [Fact]
+    public void Declared_List_Count_Must_Fit_In_Remaining_Data_Before_Array_Allocation()
+    {
+        var encodedBytes = new ReadOnlySequence<byte>(new byte[] { 0x01, 0xFF });
+
+        Action decode = () => DecodeFromFullBuffer(ref encodedBytes);
+
+        decode.Should().Throw<InvalidDataException>()
+            .WithMessage("*declares 255 item(s)*");
+    }
+
+    [Fact]
+    public void List_Nesting_Over_Maximum_Depth_Should_Be_Rejected()
+    {
+        var data = new byte[((MaximumListNestingDepth + 1) * 2) + 2];
+        for (var i = 0; i <= MaximumListNestingDepth; i++)
+        {
+            data[i * 2] = 0x01;     // List with one length byte
+            data[(i * 2) + 1] = 1; // containing one child
+        }
+        data[^2] = 0x01;
+        data[^1] = 0; // innermost empty List
+        var encodedBytes = new ReadOnlySequence<byte>(data);
+
+        Action decode = () => DecodeFromFullBuffer(ref encodedBytes);
+
+        decode.Should().Throw<InvalidDataException>()
+            .WithMessage("*nesting exceeds the maximum depth*");
+    }
+
+    [Fact]
+    public void Numeric_Item_Byte_Length_Must_Match_Element_Size_Before_Pooled_Allocation()
+    {
+        var invalidU2Data = new ReadOnlySequence<byte>(new byte[1025]);
+
+        Action decode = () => DecodeDataItem(SecsFormat.U2, invalidU2Data);
+
+        decode.Should().Throw<InvalidDataException>()
+            .WithMessage("*length 1025 is not divisible by its 2-byte element size*");
     }
 
     [Fact]

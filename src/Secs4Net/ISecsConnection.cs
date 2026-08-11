@@ -6,6 +6,8 @@ public interface ISecsConnection
 {
     public event EventHandler<ConnectionState>? ConnectionChanged;
 
+    internal event EventHandler<DataMessageDecodeErrorEventArgs>? DataMessageDecodeError;
+
     /// <summary>
     /// Connection state
     /// </summary>

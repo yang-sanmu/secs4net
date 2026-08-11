@@ -59,6 +59,7 @@ public sealed class SecsGem : ISecsGem, IDisposable
 
         _hsmsConnector = hsmsConnector;
         _logger = logger;
+        _hsmsConnector.DataMessageDecodeError += OnDataMessageDecodeError;
 
         Task.Run(async () =>
         {
@@ -68,6 +69,43 @@ public sealed class SecsGem : ISecsGem, IDisposable
                 await ProcessDataMessageAsync(header, rootItem, cancellationToken).ConfigureAwait(continueOnCapturedContext: false);
             }
         });
+    }
+
+    private void OnDataMessageDecodeError(object? sender, DataMessageDecodeErrorEventArgs e)
+    {
+        // S9 messages are already protocol errors, and a message without W-bit does not leave
+        // an outstanding transaction at the sender. Avoid creating an S9F7 error loop.
+        if (Volatile.Read(ref _disposeStage) == DisposalComplete
+            || !e.Header.ReplyExpected
+            || e.Header.S == 9)
+        {
+            return;
+        }
+
+        _ = SendS9F7Async(e.Header);
+    }
+
+    private async Task SendS9F7Async(MessageHeader malformedMessageHeader)
+    {
+        try
+        {
+            var cancellation = _cancellationSourceForDataMessageProcessing.Token;
+            var headerBytes = new byte[10];
+            malformedMessageHeader.EncodeTo(new MemoryBufferWriter<byte>(headerBytes));
+            var s9f7 = new SecsMessage(9, 7, replyExpected: false)
+            {
+                Name = "Illegal Data",
+                SecsItem = Item.B(headerBytes),
+            };
+
+            await SendDataMessageAsync(s9f7, MessageIdGenerator.NewId(), cancellation).ConfigureAwait(false);
+        }
+        catch (OperationCanceledException) when (Volatile.Read(ref _disposeStage) == DisposalComplete) { }
+        catch (ObjectDisposedException) when (Volatile.Read(ref _disposeStage) == DisposalComplete) { }
+        catch (Exception ex)
+        {
+            _logger.Error("Failed to send S9F7 for malformed SECS-II data message.", ex);
+        }
     }
 
     internal async Task<SecsMessage> SendDataMessageAsync(SecsMessage message, int id, CancellationToken cancellation)
@@ -212,6 +250,7 @@ public sealed class SecsGem : ISecsGem, IDisposable
             throw new ObjectDisposedException(nameof(SecsGem));
         }
 
+        _hsmsConnector.DataMessageDecodeError -= OnDataMessageDecodeError;
         _cancellationSourceForDataMessageProcessing.Cancel();
         _cancellationSourceForDataMessageProcessing.Dispose();
         _replyExpectedMessages.Clear();
@@ -224,6 +263,7 @@ public sealed class SecsGem : ISecsGem, IDisposable
     public static unsafe void EncodeMessage(SecsMessage msg, int id, ushort deviceId, ArrayPoolBufferWriter<byte> buffer)
 #endif
     {
+        var messageStart = buffer.WrittenCount;
         buffer.GetSpan(14);
         // reserve 4 byte for total length
         buffer.Advance(sizeof(int));
@@ -239,11 +279,11 @@ public sealed class SecsGem : ISecsGem, IDisposable
         msg.SecsItem?.EncodeTo(buffer);
 
 #if NET
-        var lengthBytes = MemoryMarshal.CreateSpan(ref MemoryMarshal.GetReference(buffer.WrittenSpan), 4);
+        var lengthBytes = MemoryMarshal.CreateSpan(ref MemoryMarshal.GetReference(buffer.WrittenSpan[messageStart..]), 4);
 #else
-        var lengthBytes = new Span<byte>(Unsafe.AsPointer(ref MemoryMarshal.GetReference(buffer.WrittenSpan)), 4);
+        var lengthBytes = new Span<byte>(Unsafe.AsPointer(ref MemoryMarshal.GetReference(buffer.WrittenSpan[messageStart..])), 4);
 #endif
-        BinaryPrimitives.WriteInt32BigEndian(lengthBytes, buffer.WrittenCount - sizeof(int));
+        BinaryPrimitives.WriteInt32BigEndian(lengthBytes, buffer.WrittenCount - messageStart - sizeof(int));
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

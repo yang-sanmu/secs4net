@@ -1,6 +1,7 @@
-﻿using CommunityToolkit.HighPerformance;
+using CommunityToolkit.HighPerformance;
 using System.Buffers;
 using System.Buffers.Binary;
+using System.IO;
 using System.IO.Pipelines;
 using System.Runtime.CompilerServices;
 using System.Threading.Channels;
@@ -9,8 +10,19 @@ namespace Secs4Net;
 
 public sealed class PipeDecoder
 {
+    private const int MessageHeaderLength = 10;
+    private const int DecodeErrorDataPreviewLength = 4096;
+
     private readonly PipeReader _reader;
     public PipeWriter Input { get; }
+
+    /// <summary>
+    /// Raised when an HSMS data message has a complete frame but its SECS-II payload is malformed.
+    /// The malformed frame is skipped and decoding continues with the next HSMS frame.
+    /// </summary>
+    public event EventHandler<DataMessageDecodeErrorEventArgs>? DataMessageDecodeError;
+
+    internal event Action? IncrementalDataMessageDecodingStarted;
 
     private readonly Channel<MessageHeader> _controlMessageChannel = Channel
         .CreateUnbounded<MessageHeader>(new UnboundedChannelOptions
@@ -43,46 +55,47 @@ public sealed class PipeDecoder
     public Task StartAsync(CancellationToken cancellation)
         => DecodeLoopAsync(_controlMessageChannel.Writer, _dataMessageChannel.Writer, _reader, cancellation);
 
-    private static async Task DecodeLoopAsync(
+    private async Task DecodeLoopAsync(
         ChannelWriter<MessageHeader> controlMessageWriter,
         ChannelWriter<(MessageHeader header, Item? rootItem)> dataMessageWriter,
         PipeReader reader,
         CancellationToken cancellation)
     {
-        var stack = new Stack<ItemList>(capacity: 8);
-        Item item;
         var totalLengthBytes = new byte[4];
-        var messageHeaderBytes = new byte[10];
-        // PipeReader peek first
+        var messageHeaderBytes = new byte[MessageHeaderLength];
         var buffer = await PipeReadAsync(reader, required: 4, cancellation).ConfigureAwait(false);
+
         while (!cancellation.IsCancellationRequested)
         {
-        Start:
-            // 0: get total message length 4 bytes
             if (IsBufferInsufficient(reader, ref buffer, required: 4))
             {
                 buffer = await PipeReadAsync(reader, required: 4, cancellation).ConfigureAwait(false);
             }
-            var totalLengthSeq = buffer.Slice(buffer.Start, 4);
-            totalLengthSeq.CopyTo(totalLengthBytes);
-            uint messageLength = BinaryPrimitives.ReadUInt32BigEndian(totalLengthBytes);
-            buffer = buffer.Slice(totalLengthSeq.End);
 
-            Debug.WriteLine($"Get new message with length: {messageLength}");
+            var totalLengthSequence = buffer.Slice(buffer.Start, 4);
+            totalLengthSequence.CopyTo(totalLengthBytes);
+            var messageLength = BinaryPrimitives.ReadUInt32BigEndian(totalLengthBytes);
+            buffer = buffer.Slice(totalLengthSequence.End);
 
-            // 1: get message header 10 bytes
-            if (IsBufferInsufficient(reader, ref buffer, required: 10))
+            if (messageLength < MessageHeaderLength || messageLength > int.MaxValue)
             {
-                buffer = await PipeReadAsync(reader, required: 10, cancellation).ConfigureAwait(false);
+                // A corrupt HSMS length loses the frame boundary, so reconnecting is safer than
+                // trying to find the next frame in an untrusted byte stream.
+                throw new InvalidDataException($"Invalid HSMS message length: {messageLength}.");
             }
-            var messageHaderSeq = buffer.Slice(buffer.Start, 10);
-            messageHaderSeq.CopyTo(messageHeaderBytes);
+
+            if (IsBufferInsufficient(reader, ref buffer, required: MessageHeaderLength))
+            {
+                buffer = await PipeReadAsync(reader, required: MessageHeaderLength, cancellation).ConfigureAwait(false);
+            }
+
+            var messageHeaderSequence = buffer.Slice(buffer.Start, MessageHeaderLength);
+            messageHeaderSequence.CopyTo(messageHeaderBytes);
             MessageHeader.Decode(messageHeaderBytes, out var header);
-            buffer = buffer.Slice(messageHaderSeq.End);
+            buffer = buffer.Slice(messageHeaderSequence.End);
 
-            Debug.WriteLine($"Get message(id:{header.Id:X8}) header");
-
-            if (messageLength == 10) // only message header
+            var dataLength = (int)messageLength - MessageHeaderLength;
+            if (dataLength == 0)
             {
                 if (header.MessageType == MessageType.DataMessage)
                 {
@@ -92,95 +105,275 @@ public sealed class PipeDecoder
                 {
                     await controlMessageWriter.WriteAsync(header, cancellation).ConfigureAwait(false);
                 }
+
                 continue;
             }
 
-            if (buffer.Length >= messageLength - 10)
+            if (buffer.Length >= dataLength)
             {
-                var rootItem = Item.DecodeFromFullBuffer(ref buffer);
+                // Decode from a sequence bounded to this HSMS frame. A malformed List can no
+                // longer consume the length prefix or header of the following frame.
+                var encodedData = buffer.Slice(buffer.Start, dataLength);
+                buffer = buffer.Slice(encodedData.End);
 
-                Debug.WriteLine($"Get data message(id:{header.Id:X8}) with total bytes: {messageLength} and decoded directly");
-
-                await dataMessageWriter.WriteAsync((header, rootItem), cancellation).ConfigureAwait(false);
-                continue;
-            }
-
-        GetNewItem:
-            // 2: get _format + _lengthByteCount(2bit) 1 byte
-            if (IsBufferInsufficient(reader, ref buffer, required: 1))
-            {
-                buffer = await PipeReadAsync(reader, required: 1, cancellation).ConfigureAwait(false);
-            }
-
-            var formatSeq = buffer.Slice(0, 1);
-            Item.DecodeFormatAndLengthByteCount(formatSeq, out var itemFormat, out var itemContentLengthByteCount);
-
-            buffer = buffer.Slice(formatSeq.End);
-
-            // 3: get _itemLength bytes(size= _lengthByteCount), at most 3 byte
-            if (IsBufferInsufficient(reader, ref buffer, required: itemContentLengthByteCount))
-            {
-                buffer = await PipeReadAsync(reader, required: itemContentLengthByteCount, cancellation).ConfigureAwait(false);
-            }
-            var itemContentLengthBytes = buffer.Slice(0, itemContentLengthByteCount);
-            var itemContentLength = Item.DecodeDataLength(itemContentLengthBytes);
-            buffer = buffer.Slice(itemContentLengthBytes.End);
-
-            // 4: get item content
-            if (itemFormat is SecsFormat.List)
-            {
-                if (itemContentLength == 0)
+                try
                 {
-                    item = Item.L();
-                    Debug.WriteLine($"Decoded List[0]");
-                }
-                else
-                {
-                    Debug.WriteLine($"Decoded List[{itemContentLength}]");
-                    stack.Push(new ItemList(size: itemContentLength));
-                    goto GetNewItem;
-                }
-            }
-            else
-            {
-                if (IsBufferInsufficient(reader, ref buffer, required: itemContentLength))
-                {
-                    buffer = await PipeReadAsync(reader, required: itemContentLength, cancellation).ConfigureAwait(false);
-                }
-                var itemDataBytes = buffer.Slice(0, itemContentLength);
-                item = Item.DecodeDataItem(itemFormat, itemDataBytes);
-                buffer = buffer.Slice(itemDataBytes.End);
-                Debug.WriteLine($"Decoded Item[{itemFormat}], length: {itemContentLength}");
-            }
-
-            if (stack.Count > 0)
-            {
-                var list = stack.Peek();
-                list.Add(item);
-                while (list.IsFull) //stack unwind when all List's Items has decoded
-                {
-                    item = Item.L(stack.Pop().Items);
-                    //Trace.WriteLine($"Unwind List[{item.Count}]");
-                    if (stack.Count > 0)
+                    var remainedData = encodedData;
+                    var rootItem = Item.DecodeFromFullBuffer(ref remainedData);
+                    if (!remainedData.IsEmpty)
                     {
-                        list = stack.Peek();
-                        list.Add(item);
+                        rootItem.Dispose();
+                        throw CreateTrailingDataException(remainedData.Length);
+                    }
+
+                    await dataMessageWriter.WriteAsync((header, rootItem), cancellation).ConfigureAwait(false);
+                }
+                catch (Exception ex) when (IsMalformedSecsDataException(ex))
+                {
+                    var errorPreviewLength = Math.Min(dataLength, DecodeErrorDataPreviewLength);
+                    RaiseDataMessageDecodeError(
+                        header,
+                        encodedData.Slice(encodedData.Start, errorPreviewLength).ToArray(),
+                        dataIsTruncated: errorPreviewLength < dataLength,
+                        ex);
+                }
+
+                continue;
+            }
+
+            // Keep streaming large or fragmented messages so PipeWriter backpressure cannot
+            // deadlock while the decoder waits for the entire HSMS frame to be buffered.
+            IncrementalDataMessageDecodingStarted?.Invoke();
+            var stack = new Stack<ItemList>(capacity: 8);
+            var remainedDataLength = dataLength;
+            var dataPreview = new byte[Math.Min(dataLength, DecodeErrorDataPreviewLength)];
+            var previewLength = 0;
+            Item? root = null;
+
+            try
+            {
+                while (root is null)
+                {
+                    if (remainedDataLength < 1)
+                    {
+                        throw new InvalidDataException("The HSMS data ended before all declared SECS-II list items were received.");
+                    }
+
+                    if (IsBufferInsufficient(reader, ref buffer, required: 1))
+                    {
+                        buffer = await PipeReadAsync(reader, required: 1, cancellation).ConfigureAwait(false);
+                    }
+
+                    var formatSequence = buffer.Slice(buffer.Start, 1);
+                    CopyToPreview(formatSequence, dataPreview, ref previewLength);
+                    Item.DecodeFormatAndLengthByteCount(formatSequence, out var itemFormat, out var lengthByteCount);
+                    buffer = buffer.Slice(formatSequence.End);
+                    remainedDataLength--;
+
+                    if (lengthByteCount == 0)
+                    {
+                        throw new InvalidDataException("A SECS-II item must use between one and three length bytes.");
+                    }
+
+                    if (remainedDataLength < lengthByteCount)
+                    {
+                        throw new InvalidDataException("The HSMS data ended inside a SECS-II item length field.");
+                    }
+
+                    if (IsBufferInsufficient(reader, ref buffer, required: lengthByteCount))
+                    {
+                        buffer = await PipeReadAsync(reader, required: lengthByteCount, cancellation).ConfigureAwait(false);
+                    }
+
+                    var lengthSequence = buffer.Slice(buffer.Start, lengthByteCount);
+                    CopyToPreview(lengthSequence, dataPreview, ref previewLength);
+                    var itemContentLength = Item.DecodeDataLength(lengthSequence);
+                    buffer = buffer.Slice(lengthSequence.End);
+                    remainedDataLength -= lengthByteCount;
+
+                    Item item;
+                    if (itemFormat == SecsFormat.List)
+                    {
+                        if (itemContentLength == 0)
+                        {
+                            item = Item.L();
+                        }
+                        else
+                        {
+                            Item.ValidateListItemCount(itemContentLength, remainedDataLength);
+                            if (stack.Count >= Item.MaximumListNestingDepth)
+                            {
+                                throw new InvalidDataException(
+                                    $"SECS-II List nesting exceeds the maximum depth of {Item.MaximumListNestingDepth}.");
+                            }
+
+                            stack.Push(new ItemList(itemContentLength));
+                            continue;
+                        }
                     }
                     else
                     {
-                        Debug.WriteLine($"Get data message(id:{header.Id:X8}) decoded by data chunked");
-                        await dataMessageWriter.WriteAsync((header, item), cancellation).ConfigureAwait(false);
-                        goto Start;
+                        if (itemContentLength > remainedDataLength)
+                        {
+                            throw new InvalidDataException(
+                                $"SECS-II item length {itemContentLength} exceeds the {remainedDataLength} byte(s) left in the HSMS data.");
+                        }
+
+                        if (buffer.Length >= itemContentLength)
+                        {
+                            var itemDataSequence = buffer.Slice(buffer.Start, itemContentLength);
+                            CopyToPreview(itemDataSequence, dataPreview, ref previewLength);
+                            buffer = buffer.Slice(itemDataSequence.End);
+                            remainedDataLength -= itemContentLength;
+                            item = Item.DecodeDataItem(itemFormat, itemDataSequence);
+                        }
+                        else
+                        {
+                            // A single Binary/string/numeric item may be larger than the Pipe's
+                            // pause threshold. Copy it incrementally while advancing the reader so
+                            // the socket producer can continue flushing the remainder.
+                            var rentedItemData = ArrayPool<byte>.Shared.Rent(itemContentLength);
+                            try
+                            {
+                                var copiedLength = 0;
+                                while (copiedLength < itemContentLength)
+                                {
+                                    if (IsBufferInsufficient(reader, ref buffer, required: 1))
+                                    {
+                                        buffer = await PipeReadAsync(reader, required: 1, cancellation).ConfigureAwait(false);
+                                    }
+
+                                    var copyLength = (int)Math.Min(buffer.Length, itemContentLength - copiedLength);
+                                    var itemDataChunk = buffer.Slice(buffer.Start, copyLength);
+                                    itemDataChunk.CopyTo(rentedItemData.AsSpan(copiedLength, copyLength));
+                                    CopyToPreview(itemDataChunk, dataPreview, ref previewLength);
+                                    buffer = buffer.Slice(itemDataChunk.End);
+                                    remainedDataLength -= copyLength;
+                                    copiedLength += copyLength;
+                                }
+
+                                var itemDataSequence = new ReadOnlySequence<byte>(
+                                    rentedItemData.AsMemory(0, itemContentLength));
+                                item = Item.DecodeDataItem(itemFormat, itemDataSequence);
+                            }
+                            finally
+                            {
+                                ArrayPool<byte>.Shared.Return(rentedItemData);
+                            }
+                        }
+                    }
+
+                    if (stack.Count == 0)
+                    {
+                        root = item;
+                        break;
+                    }
+
+                    var list = stack.Peek();
+                    list.Add(item);
+                    while (list.IsFull)
+                    {
+                        item = Item.L(stack.Pop().Items);
+                        if (stack.Count == 0)
+                        {
+                            root = item;
+                            break;
+                        }
+
+                        list = stack.Peek();
+                        list.Add(item);
                     }
                 }
-                goto GetNewItem;
+
+                if (remainedDataLength != 0)
+                {
+                    root.Dispose();
+                    root = null;
+                    throw CreateTrailingDataException(remainedDataLength);
+                }
+
+                await dataMessageWriter.WriteAsync((header, root), cancellation).ConfigureAwait(false);
             }
-            else
+            catch (Exception ex) when (IsMalformedSecsDataException(ex))
             {
-                Debug.WriteLine($"Get data message(id:{header.Id:X8}) decoded by data chunked");
-                await dataMessageWriter.WriteAsync((header, item), cancellation).ConfigureAwait(false);
+                root?.Dispose();
+                foreach (var itemList in stack)
+                {
+                    itemList.DisposeItems();
+                }
+
+                // The HSMS length is still trustworthy. Discard exactly the rest of this frame,
+                // then resume at the next four-byte HSMS length prefix.
+                while (remainedDataLength > 0)
+                {
+                    if (IsBufferInsufficient(reader, ref buffer, required: 1))
+                    {
+                        buffer = await PipeReadAsync(reader, required: 1, cancellation).ConfigureAwait(false);
+                    }
+
+                    var discardLength = (int)Math.Min(buffer.Length, remainedDataLength);
+                    var discarded = buffer.Slice(buffer.Start, discardLength);
+                    CopyToPreview(discarded, dataPreview, ref previewLength);
+                    buffer = buffer.Slice(discarded.End);
+                    remainedDataLength -= discardLength;
+                }
+
+                RaiseDataMessageDecodeError(
+                    header,
+                    dataPreview.AsMemory(0, previewLength),
+                    dataIsTruncated: previewLength < dataLength,
+                    ex);
             }
         }
+    }
+
+    private void RaiseDataMessageDecodeError(
+        MessageHeader header,
+        ReadOnlyMemory<byte> encodedData,
+        bool dataIsTruncated,
+        Exception exception)
+    {
+        var handlers = DataMessageDecodeError;
+        if (handlers is null)
+        {
+            return;
+        }
+
+        var eventArgs = new DataMessageDecodeErrorEventArgs(header, encodedData, dataIsTruncated, exception);
+        foreach (EventHandler<DataMessageDecodeErrorEventArgs> handler in handlers.GetInvocationList())
+        {
+            try
+            {
+                handler(this, eventArgs);
+            }
+            catch (Exception subscriberException)
+            {
+                Trace.TraceError($"Unhandled exception in {nameof(DataMessageDecodeError)} subscriber: {subscriberException}");
+            }
+        }
+    }
+
+    private static InvalidDataException CreateTrailingDataException(long trailingByteCount)
+        => new($"The SECS-II root item left {trailingByteCount} trailing byte(s) in the HSMS data message.");
+
+    private static bool IsMalformedSecsDataException(Exception exception)
+        => exception is ArgumentException
+            or IndexOutOfRangeException
+            or InvalidDataException;
+
+    private static void CopyToPreview(
+        in ReadOnlySequence<byte> source,
+        Span<byte> preview,
+        ref int previewLength)
+    {
+        var copyLength = (int)Math.Min(source.Length, preview.Length - previewLength);
+        if (copyLength <= 0)
+        {
+            return;
+        }
+
+        source.Slice(source.Start, copyLength).CopyTo(preview[previewLength..]);
+        previewLength += copyLength;
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -205,10 +398,8 @@ public sealed class PipeDecoder
             {
                 return true;
             }
-            else
-            {
-                reader.AdvanceTo(consumed: buffer.Start, examined: buffer.End);
-            }
+
+            reader.AdvanceTo(consumed: buffer.Start, examined: buffer.End);
         }
 
         return false;
@@ -234,15 +425,14 @@ public sealed class PipeDecoder
         {
             while (true)
             {
-                //StartT8Timer();
                 var result = await reader.ReadAsync(cancellation).ConfigureAwait(false);
-                //StopT8Timer();
                 var buffer = result.Buffer;
 
                 if (buffer.Length >= required)
                 {
                     return buffer;
                 }
+
                 reader.AdvanceTo(consumed: buffer.Start, examined: buffer.End);
             }
         }
@@ -256,5 +446,13 @@ public sealed class PipeDecoder
         public bool IsFull => _current == _items.Length;
         public void Add(Item item) => _items[_current++] = item;
         public Item[] Items => _items;
+
+        public void DisposeItems()
+        {
+            for (var i = 0; i < _current; i++)
+            {
+                _items[i].Dispose();
+            }
+        }
     }
 }

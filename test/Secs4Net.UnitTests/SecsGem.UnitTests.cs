@@ -75,6 +75,37 @@ public class SecsGemUnitTests
     }
 
     [Fact]
+    public async Task Malformed_WBit_Primary_Message_Should_Reply_S9F7_With_Original_Header()
+    {
+        byte[] malformedMessage =
+        [
+            0x00, 0x00, 0x00, 0x1B,
+            0x7F, 0xFF, 0x86, 0x0B, 0x00, 0x00, 0x06, 0x0B, 0x00, 0xD6,
+            0x01, 0x03, 0xA5, 0x01, 0x3C, 0xA9, 0x02, 0x00, 0x16,
+            0x01, 0x01, 0x01, 0x02, 0xA9, 0x02, 0x22, 0xB8,
+        ];
+
+        using var secsGem = new SecsGem(OptionsActive, _pipeConnection2, Substitute.For<ISecsGemLogger>());
+        using var cancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        _pipeConnection1.Start(cancellationSource.Token);
+        _pipeConnection2.Start(cancellationSource.Token);
+
+        await ((ISecsConnection)_pipeConnection1).SendAsync(malformedMessage, cancellationSource.Token);
+        var (replyHeader, replyItem) = await ((ISecsConnection)_pipeConnection1)
+            .GetDataMessages(cancellationSource.Token)
+            .FirstAsync(cancellationSource.Token);
+
+        replyHeader.S.Should().Be(9);
+        replyHeader.F.Should().Be(7);
+        replyHeader.ReplyExpected.Should().BeFalse();
+        replyItem.Should().NotBeNull();
+        using (replyItem)
+        {
+            replyItem!.GetMemory<byte>().ToArray().Should().Equal(malformedMessage.Skip(4).Take(10));
+        }
+    }
+
+    [Fact]
     public void SecsGem_SendAsync_With_Different_Device_Id()
     {
         var options1 = Options.Create(new SecsGemOptions
@@ -319,4 +350,5 @@ public class SecsGemUnitTests
         listener.Start();
         return ((IPEndPoint)listener.LocalEndpoint).Port;
     }
+
 }

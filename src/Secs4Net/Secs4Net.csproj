@@ -1,8 +1,10 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
+		<PackageId>$(ForkPackagePrefix)</PackageId>
 		<TargetFrameworks>net10.0;net9.0;net8.0;.net6.0;netstandard2.0</TargetFrameworks>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+		<Description>Fork of Secs4Net with SECS-II/HSMS-SS/GEM support for .NET.</Description>
 		<GenerateDocumentationFile>True</GenerateDocumentationFile>
 		<IsAotCompatible Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net8.0'))">true</IsAotCompatible>
 		<PackageReadmeFile>README.md</PackageReadmeFile>

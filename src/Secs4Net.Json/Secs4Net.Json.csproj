@@ -1,8 +1,11 @@
 ﻿<Project Sdk="Microsoft.NET.Sdk">
 
 	<PropertyGroup>
+		<PackageId>$(ForkPackagePrefix).Json</PackageId>
 		<TargetFrameworks>net10.0;netstandard2.0</TargetFrameworks>
-		<IsPackable>false</IsPackable>
+		<Description>JSON support package for the forked Secs4Net distribution.</Description>
+		<IsPackable>true</IsPackable>
+		<PackageReadmeFile>README.md</PackageReadmeFile>
 	</PropertyGroup>
 
 	<ItemGroup>
@@ -19,6 +22,13 @@
 
 	<ItemGroup>
 		<ProjectReference Include="..\Secs4Net\Secs4Net.csproj" />
+	</ItemGroup>
+
+	<ItemGroup>
+		<None Include="README.md">
+			<Pack>True</Pack>
+			<PackagePath>\</PackagePath>
+		</None>
 	</ItemGroup>
 
 </Project>

@@ -91,6 +91,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
     {
         var pipe = new Pipe(new PipeOptions(useSynchronizationContext: true));
         _pipeDecoder = new PipeDecoder(pipe.Reader, pipe.Writer);
+        _pipeDecoder.DataMessageDecodeError += OnDataMessageDecodeError;
         _pipe = pipe;
         _logger = logger;
         var options = secsGemOptions.Value;
@@ -236,6 +237,17 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
                 }
             };
         }
+    }
+
+    private void OnDataMessageDecodeError(object? sender, DataMessageDecodeErrorEventArgs e)
+    {
+        var rawData = BitConverter.ToString(e.EncodedData.ToArray()).Replace("-", " ");
+        var truncatedSuffix = e.DataIsTruncated ? " (truncated)" : string.Empty;
+        _logger.Error(
+            $"Malformed SECS-II data message S{e.Header.S}F{e.Header.F} " +
+            $"[0x{e.Header.Id:X8}] was skipped; the HSMS connection remains active. " +
+            $"Raw data{truncatedSuffix}: {rawData}",
+            e.Exception);
     }
 
     private void Disconnect()
@@ -621,6 +633,12 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
 
     Task ISecsConnection.SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellation)
         => SendAsync(buffer, cancellation);
+
+    event EventHandler<DataMessageDecodeErrorEventArgs>? ISecsConnection.DataMessageDecodeError
+    {
+        add => _pipeDecoder.DataMessageDecodeError += value;
+        remove => _pipeDecoder.DataMessageDecodeError -= value;
+    }
 
 #if NET
     private async Task SendAsync(ReadOnlyMemory<byte> buffer, CancellationToken cancellation)

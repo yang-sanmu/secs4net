@@ -1,18 +1,23 @@
-# secs4net
-
-[![.NET](https://github.com/mkjeff/secs4net/actions/workflows/dotnet.yml/badge.svg)](https://github.com/mkjeff/secs4net/actions/workflows/dotnet.yml) [![Nuget](https://img.shields.io/nuget/dt/secs4net)](https://www.nuget.org/stats/packages/Secs4Net?groupby=Version) [![NuGet](https://img.shields.io/nuget/v/secs4net.svg)](https://www.nuget.org/packages/Secs4Net) [![codecov](https://codecov.io/gh/mkjeff/secs4net/graph/badge.svg?token=AgiQxizSvE)](https://codecov.io/gh/mkjeff/secs4net)
+# secs4net fork
 
 **Project Description**  
 
 SECS-II/HSMS-SS/GEM implementation on .NET. This library provides an easy way to communicate with SEMI-standard compatible devices.  
 
+This fork is configured to publish these package IDs by default:
+- `YangSanmu.Secs4Net`
+- `YangSanmu.Secs4Net.Sml`
+- `YangSanmu.Secs4Net.Json`
+
+If you want a different prefix, update `ForkPackagePrefix` in `Directory.Build.props` before the first publish.
+
 **Getting started**
 
 ## Install Nuget package
-    > dotnet add package Secs4Net
+    > dotnet add package YangSanmu.Secs4Net
 
 ## Configure via .NET dependency injection
-[Sample code reference](https://github.com/mkjeff/secs4net/blob/base/samples/DeviceWorkerService/ServiceProvider.cs)
+Sample code reference: `samples/DeviceWorkerService/ServiceProvider.cs`
 ```cs
 public void ConfigureServices(IServiceCollection services)
 {
