@@ -14,6 +14,8 @@ public sealed class PipeDecoder
     private const int DecodeErrorDataPreviewLength = 4096;
 
     private readonly PipeReader _reader;
+    private readonly Action? _startInterChunkTimer;
+    private readonly Action? _stopInterChunkTimer;
     public PipeWriter Input { get; }
 
     /// <summary>
@@ -41,9 +43,20 @@ public sealed class PipeDecoder
         });
 
     public PipeDecoder(PipeReader reader, PipeWriter input)
+        : this(reader, input, startInterChunkTimer: null, stopInterChunkTimer: null)
+    {
+    }
+
+    internal PipeDecoder(
+        PipeReader reader,
+        PipeWriter input,
+        Action? startInterChunkTimer,
+        Action? stopInterChunkTimer)
     {
         _reader = reader;
         Input = input;
+        _startInterChunkTimer = startInterChunkTimer;
+        _stopInterChunkTimer = stopInterChunkTimer;
     }
 
     internal IAsyncEnumerable<MessageHeader> GetControlMessages(CancellationToken cancellation)
@@ -63,13 +76,17 @@ public sealed class PipeDecoder
     {
         var totalLengthBytes = new byte[4];
         var messageHeaderBytes = new byte[MessageHeaderLength];
-        var buffer = await PipeReadAsync(reader, required: 4, cancellation).ConfigureAwait(false);
+        var buffer = await PipeReadAsync(reader, required: 4, messageStarted: false, cancellation).ConfigureAwait(false);
 
         while (!cancellation.IsCancellationRequested)
         {
             if (IsBufferInsufficient(reader, ref buffer, required: 4))
             {
-                buffer = await PipeReadAsync(reader, required: 4, cancellation).ConfigureAwait(false);
+                buffer = await PipeReadAsync(
+                    reader,
+                    required: 4,
+                    messageStarted: !buffer.IsEmpty,
+                    cancellation).ConfigureAwait(false);
             }
 
             var totalLengthSequence = buffer.Slice(buffer.Start, 4);
@@ -86,7 +103,7 @@ public sealed class PipeDecoder
 
             if (IsBufferInsufficient(reader, ref buffer, required: MessageHeaderLength))
             {
-                buffer = await PipeReadAsync(reader, required: MessageHeaderLength, cancellation).ConfigureAwait(false);
+                buffer = await PipeReadAsync(reader, required: MessageHeaderLength, messageStarted: true, cancellation).ConfigureAwait(false);
             }
 
             var messageHeaderSequence = buffer.Slice(buffer.Start, MessageHeaderLength);
@@ -95,6 +112,7 @@ public sealed class PipeDecoder
             buffer = buffer.Slice(messageHeaderSequence.End);
 
             var dataLength = (int)messageLength - MessageHeaderLength;
+            ValidateHsmsHeader(messageHeaderBytes, header, dataLength);
             if (dataLength == 0)
             {
                 if (header.MessageType == MessageType.DataMessage)
@@ -161,7 +179,7 @@ public sealed class PipeDecoder
 
                     if (IsBufferInsufficient(reader, ref buffer, required: 1))
                     {
-                        buffer = await PipeReadAsync(reader, required: 1, cancellation).ConfigureAwait(false);
+                        buffer = await PipeReadAsync(reader, required: 1, messageStarted: true, cancellation).ConfigureAwait(false);
                     }
 
                     var formatSequence = buffer.Slice(buffer.Start, 1);
@@ -182,7 +200,7 @@ public sealed class PipeDecoder
 
                     if (IsBufferInsufficient(reader, ref buffer, required: lengthByteCount))
                     {
-                        buffer = await PipeReadAsync(reader, required: lengthByteCount, cancellation).ConfigureAwait(false);
+                        buffer = await PipeReadAsync(reader, required: lengthByteCount, messageStarted: true, cancellation).ConfigureAwait(false);
                     }
 
                     var lengthSequence = buffer.Slice(buffer.Start, lengthByteCount);
@@ -240,7 +258,7 @@ public sealed class PipeDecoder
                                 {
                                     if (IsBufferInsufficient(reader, ref buffer, required: 1))
                                     {
-                                        buffer = await PipeReadAsync(reader, required: 1, cancellation).ConfigureAwait(false);
+                                        buffer = await PipeReadAsync(reader, required: 1, messageStarted: true, cancellation).ConfigureAwait(false);
                                     }
 
                                     var copyLength = (int)Math.Min(buffer.Length, itemContentLength - copiedLength);
@@ -308,7 +326,7 @@ public sealed class PipeDecoder
                 {
                     if (IsBufferInsufficient(reader, ref buffer, required: 1))
                     {
-                        buffer = await PipeReadAsync(reader, required: 1, cancellation).ConfigureAwait(false);
+                        buffer = await PipeReadAsync(reader, required: 1, messageStarted: true, cancellation).ConfigureAwait(false);
                     }
 
                     var discardLength = (int)Math.Min(buffer.Length, remainedDataLength);
@@ -355,6 +373,43 @@ public sealed class PipeDecoder
 
     private static InvalidDataException CreateTrailingDataException(long trailingByteCount)
         => new($"The SECS-II root item left {trailingByteCount} trailing byte(s) in the HSMS data message.");
+
+    private static void ValidateHsmsHeader(ReadOnlySpan<byte> encodedHeader, MessageHeader header, int dataLength)
+    {
+        var pType = encodedHeader[4];
+        if (pType != 0)
+        {
+            throw new InvalidDataException(
+                $"Invalid HSMS header PType 0x{pType:X2}; only PType 0 is defined. Header: {FormatHeader(encodedHeader)}");
+        }
+
+        if (!IsDefinedMessageType(header.MessageType))
+        {
+            throw new InvalidDataException(
+                $"Invalid HSMS header SType 0x{(byte)header.MessageType:X2}. Header: {FormatHeader(encodedHeader)}");
+        }
+
+        if (header.MessageType != MessageType.DataMessage && dataLength != 0)
+        {
+            throw new InvalidDataException(
+                $"Invalid HSMS control message {header.MessageType}: control messages cannot contain a {dataLength}-byte data field. " +
+                $"Header: {FormatHeader(encodedHeader)}");
+        }
+    }
+
+    private static string FormatHeader(ReadOnlySpan<byte> encodedHeader)
+        => BitConverter.ToString(encodedHeader.ToArray()).Replace("-", " ");
+
+    private static bool IsDefinedMessageType(MessageType messageType)
+        => messageType is MessageType.DataMessage
+            or MessageType.SelectRequest
+            or MessageType.SelectResponse
+            or MessageType.Deselect_req
+            or MessageType.Deselect_rsp
+            or MessageType.LinkTestRequest
+            or MessageType.LinkTestResponse
+            or MessageType.Reject_req
+            or MessageType.SeparateRequest;
 
     private static bool IsMalformedSecsDataException(Exception exception)
         => exception is ArgumentException
@@ -407,7 +462,11 @@ public sealed class PipeDecoder
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     [SkipLocalsInit]
-    private static ValueTask<ReadOnlySequence<byte>> PipeReadAsync(PipeReader reader, int required, CancellationToken cancellation)
+    private ValueTask<ReadOnlySequence<byte>> PipeReadAsync(
+        PipeReader reader,
+        int required,
+        bool messageStarted,
+        CancellationToken cancellation)
     {
         ReadOnlySequence<byte> buffer = ReadOnlySequence<byte>.Empty;
         if (PipeTryRead(reader, required, ref buffer))
@@ -415,25 +474,64 @@ public sealed class PipeDecoder
             return new(buffer);
         }
 
-        return SlowPipeReadAsync(reader, required, cancellation);
+        // Do not run T8 while the connection is idle between HSMS messages. Once any bytes of a
+        // new message have arrived (or its length prefix was already consumed), T8 covers only
+        // the wait for the next chunk and is stopped as soon as that wait completes.
+        return SlowPipeReadAsync(
+            reader,
+            required,
+            messageStarted || !buffer.IsEmpty,
+            _startInterChunkTimer,
+            _stopInterChunkTimer,
+            cancellation);
 
         [MethodImpl(MethodImplOptions.NoInlining)]
 #if NET
         [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder<>))]
 #endif
-        static async ValueTask<ReadOnlySequence<byte>> SlowPipeReadAsync(PipeReader reader, int required, CancellationToken cancellation)
+        static async ValueTask<ReadOnlySequence<byte>> SlowPipeReadAsync(
+            PipeReader reader,
+            int required,
+            bool messageStarted,
+            Action? startInterChunkTimer,
+            Action? stopInterChunkTimer,
+            CancellationToken cancellation)
         {
             while (true)
             {
-                var result = await reader.ReadAsync(cancellation).ConfigureAwait(false);
-                var buffer = result.Buffer;
-
-                if (buffer.Length >= required)
+                var timerStarted = false;
+                try
                 {
-                    return buffer;
-                }
+                    if (messageStarted)
+                    {
+                        startInterChunkTimer?.Invoke();
+                        timerStarted = true;
+                    }
 
-                reader.AdvanceTo(consumed: buffer.Start, examined: buffer.End);
+                    var result = await reader.ReadAsync(cancellation).ConfigureAwait(false);
+                    var buffer = result.Buffer;
+
+                    if (buffer.Length >= required)
+                    {
+                        return buffer;
+                    }
+
+                    if (result.IsCompleted)
+                    {
+                        throw new EndOfStreamException(
+                            $"The HSMS byte stream ended with {buffer.Length} of {required} required byte(s) available.");
+                    }
+
+                    messageStarted |= !buffer.IsEmpty;
+                    reader.AdvanceTo(consumed: buffer.Start, examined: buffer.End);
+                }
+                finally
+                {
+                    if (timerStarted)
+                    {
+                        stopInterChunkTimer?.Invoke();
+                    }
+                }
             }
         }
     }

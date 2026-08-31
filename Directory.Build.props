@@ -1,6 +1,6 @@
 <Project>
 	<PropertyGroup>
-		<Version>3.1.4</Version>
+		<Version>3.1.6</Version>
 		<!-- Change these three properties before the first public release of your fork. -->
 		<ForkPackagePrefix>YangSanmu.Secs4Net</ForkPackagePrefix>
 		<ForkMaintainer>yang-sanmu</ForkMaintainer>

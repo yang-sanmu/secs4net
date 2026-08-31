@@ -184,19 +184,32 @@ public sealed class SecsGem : ISecsGem, IDisposable
 
         try
         {
-            if (header.DeviceId != DeviceId && header.S != 9 && header.F != 1)
+            if (header.DeviceId != DeviceId)
             {
-                _logger.MessageIn(msg, header.Id);
-                _logger.Warning("Received Unrecognized Device Id Message");
-                var headerBytes = new byte[10];
-                header.EncodeTo(new MemoryBufferWriter<byte>(headerBytes));
-                var s9f1 = new SecsMessage(9, 1, replyExpected: false)
+                // SEMI E5: an SxF0 aborts a transaction and must never be answered, and an S9
+                // message must never be answered with another S9. Still let both message types
+                // reach the normal secondary/error path so a matching local transaction is ended
+                // immediately instead of waiting for T3.
+                if (header.F == 0 || header.S == 9)
                 {
-                    Name = "Unrecognized Device Id",
-                    SecsItem = Item.B(headerBytes),
-                };
-                await SendDataMessageAsync(s9f1, MessageIdGenerator.NewId(), cancellation).ConfigureAwait(false);
-                return;
+                    _logger.Warning(
+                        $"Received Unrecognized Device Id Message S{header.S}F{header.F}; processing without a reply.");
+                }
+                else
+                {
+                    _logger.MessageIn(msg, header.Id);
+                    _logger.Warning("Received Unrecognized Device Id Message");
+                    var headerBytes = new byte[10];
+                    header.EncodeTo(new MemoryBufferWriter<byte>(headerBytes));
+                    using var s9f1 = new SecsMessage(9, 1, replyExpected: false)
+                    {
+                        Name = "Unrecognized Device Id",
+                        SecsItem = Item.B(headerBytes),
+                    };
+                    await SendDataMessageAsync(s9f1, MessageIdGenerator.NewId(), cancellation).ConfigureAwait(false);
+                    msg.Dispose();
+                    return;
+                }
             }
 
             var id = header.Id;

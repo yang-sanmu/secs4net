@@ -173,6 +173,127 @@ public class PipeDecoderUnitTests
         await FluentActions.Awaiting(() => decoderTask).Should().ThrowAsync<OperationCanceledException>();
     }
 
+    [Theory]
+    [InlineData(4, 0x01, "PType")]
+    [InlineData(5, 0x7F, "SType")]
+    public async Task Invalid_Hsms_Header_Stops_Decoder(int headerByteIndex, byte value, string expectedDetail)
+    {
+        byte[] encodedMessage =
+        [
+            0x00, 0x00, 0x00, 0x0A,
+            0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        encodedMessage[4 + headerByteIndex] = value;
+
+        var pipe = new Pipe();
+        var decoder = new PipeDecoder(pipe.Reader, pipe.Writer);
+        using var cancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var decoderTask = decoder.StartAsync(cancellationSource.Token);
+
+        await decoder.Input.WriteAsync(encodedMessage, cancellationSource.Token);
+
+        await FluentActions.Awaiting(() => decoderTask)
+            .Should().ThrowAsync<InvalidDataException>()
+            .WithMessage($"*{expectedDetail}*");
+    }
+
+    [Fact]
+    public async Task Hsms_Control_Message_With_Data_Field_Stops_Decoder()
+    {
+        byte[] encodedMessage =
+        [
+            0x00, 0x00, 0x00, 0x0B,
+            0xFF, 0xFF, 0x00, 0x00, 0x00, 0x05,
+            0x00, 0x00, 0x00, 0x01,
+            0x00,
+        ];
+
+        var pipe = new Pipe();
+        var decoder = new PipeDecoder(pipe.Reader, pipe.Writer);
+        using var cancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var decoderTask = decoder.StartAsync(cancellationSource.Token);
+
+        await decoder.Input.WriteAsync(encodedMessage, cancellationSource.Token);
+
+        await FluentActions.Awaiting(() => decoderTask)
+            .Should().ThrowAsync<InvalidDataException>()
+            .WithMessage("*control messages cannot contain*");
+    }
+
+    [Fact]
+    public async Task InterChunk_Timer_Only_Covers_Wait_Inside_A_Partial_Hsms_Message()
+    {
+        byte[] encodedMessage =
+        [
+            0x00, 0x00, 0x00, 0x0A,
+            0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        var timerStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var timerStopped = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipe = new Pipe();
+        var decoder = new PipeDecoder(
+            pipe.Reader,
+            pipe.Writer,
+            () => timerStarted.TrySetResult(true),
+            () => timerStopped.TrySetResult(true));
+        using var cancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var decoderTask = decoder.StartAsync(cancellationSource.Token);
+
+        // An idle connection is not an inter-chunk wait and must not run T8.
+        await Task.Delay(100, cancellationSource.Token);
+        timerStarted.Task.IsCompleted.Should().BeFalse();
+
+        // Two bytes start the HSMS length prefix but cannot complete it, so T8 starts.
+        await decoder.Input.WriteAsync(encodedMessage.AsMemory(0, 2), cancellationSource.Token);
+        await WaitWithTimeoutAsync(timerStarted.Task, TimeSpan.FromSeconds(5));
+        timerStopped.Task.IsCompleted.Should().BeFalse();
+
+        // Supplying the rest completes the pending read and stops T8 immediately.
+        await decoder.Input.WriteAsync(encodedMessage.AsMemory(2), cancellationSource.Token);
+        var decodedMessage = await decoder.GetDataMessages(cancellationSource.Token).FirstAsync();
+        await WaitWithTimeoutAsync(timerStopped.Task, TimeSpan.FromSeconds(5));
+
+        decodedMessage.header.Id.Should().Be(1);
+        decodedMessage.rootItem.Should().BeNull();
+
+        cancellationSource.Cancel();
+        await FluentActions.Awaiting(() => decoderTask).Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    [Fact]
+    public async Task InterChunk_Timer_Covers_A_Partial_Length_Prefix_After_A_Complete_Frame()
+    {
+        byte[] encodedMessage =
+        [
+            0x00, 0x00, 0x00, 0x0A,
+            0x00, 0x00, 0x01, 0x01, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01,
+        ];
+        var timerStarted = new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipe = new Pipe();
+        var decoder = new PipeDecoder(
+            pipe.Reader,
+            pipe.Writer,
+            () => timerStarted.TrySetResult(true),
+            () => { });
+        using var cancellationSource = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var decoderTask = decoder.StartAsync(cancellationSource.Token);
+
+        // The first frame is complete, while the same socket chunk ends two bytes into the next
+        // length prefix. T8 applies to that second, already-started frame.
+        var input = encodedMessage.Concat(encodedMessage.Take(2)).ToArray();
+        await decoder.Input.WriteAsync(input, cancellationSource.Token);
+        var firstMessage = await decoder.GetDataMessages(cancellationSource.Token).FirstAsync();
+        await WaitWithTimeoutAsync(timerStarted.Task, TimeSpan.FromSeconds(5));
+
+        firstMessage.header.Id.Should().Be(1);
+
+        cancellationSource.Cancel();
+        await FluentActions.Awaiting(() => decoderTask).Should().ThrowAsync<OperationCanceledException>();
+    }
+
     [Fact]
     public async Task Malformed_Data_Message_Is_Skipped_Without_Stopping_Decoder()
     {
@@ -314,5 +435,15 @@ public class PipeDecoderUnitTests
 
         cancellationSource.Cancel();
         await FluentActions.Awaiting(() => decoderTask).Should().ThrowAsync<OperationCanceledException>();
+    }
+
+    private static async Task<T> WaitWithTimeoutAsync<T>(Task<T> task, TimeSpan timeout)
+    {
+        if (await Task.WhenAny(task, Task.Delay(timeout)) != task)
+        {
+            throw new TimeoutException($"The operation did not complete within {timeout}.");
+        }
+
+        return await task;
     }
 }

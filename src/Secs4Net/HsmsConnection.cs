@@ -90,7 +90,7 @@ public sealed class HsmsConnection : ISecsConnection, IAsyncDisposable
     public HsmsConnection(IOptions<SecsGemOptions> secsGemOptions, ISecsGemLogger logger)
     {
         var pipe = new Pipe(new PipeOptions(useSynchronizationContext: true));
-        _pipeDecoder = new PipeDecoder(pipe.Reader, pipe.Writer);
+        _pipeDecoder = new PipeDecoder(pipe.Reader, pipe.Writer, StartT8Timer, StopT8Timer);
         _pipeDecoder.DataMessageDecodeError += OnDataMessageDecodeError;
         _pipe = pipe;
         _logger = logger;

@@ -2,7 +2,7 @@
 
 	<PropertyGroup>
 		<PackageId>$(ForkPackagePrefix)</PackageId>
-		<TargetFrameworks>net10.0;net9.0;net8.0;.net6.0;netstandard2.0</TargetFrameworks>
+		<TargetFrameworks>net10.0;net9.0;net8.0;net6.0;netstandard2.0</TargetFrameworks>
 		<AllowUnsafeBlocks>true</AllowUnsafeBlocks>
 		<Description>Fork of Secs4Net with SECS-II/HSMS-SS/GEM support for .NET.</Description>
 		<GenerateDocumentationFile>True</GenerateDocumentationFile>

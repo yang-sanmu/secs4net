@@ -2,7 +2,7 @@
 
   <PropertyGroup>
     <PackageId>$(ForkPackagePrefix).Sml</PackageId>
-    <TargetFrameworks>net10.0;net9.0;net8.0;.net6.0;netstandard2.0</TargetFrameworks>
+    <TargetFrameworks>net10.0;net9.0;net8.0;net6.0;netstandard2.0</TargetFrameworks>
     <Description>SML support package for the forked Secs4Net distribution.</Description>
     <IsAotCompatible Condition="$([MSBuild]::IsTargetFrameworkCompatible('$(TargetFramework)', 'net8.0'))">true</IsAotCompatible>
     <PackageReadmeFile>README.md</PackageReadmeFile>
